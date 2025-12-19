@@ -1,0 +1,24 @@
+[package]
+name = "proiect"
+version = "0.1.0"
+edition = "2021"
+
+# Configurația pentru biblioteca ta (motorul criptografic)
+[lib]
+crate-type = ["rlib"]
+
+# Configurații pentru optimizarea compilării
+[profile.dev]
+opt-level = 1
+debug = true
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[dependencies]
+rhdl = {git = "https://github.com/samitbasu/rhdl.git",rev = "8d04954"}
+rhdl-fpga = {git = "https://github.com/samitbasu/rhdl.git",rev = "8d04954"}
+rhdl-bits = {git = "https://github.com/samitbasu/rhdl.git",rev = "8d04954"}
