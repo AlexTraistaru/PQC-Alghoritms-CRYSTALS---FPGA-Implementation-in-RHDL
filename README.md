@@ -1,6 +1,6 @@
 # Post-Quantum Cryptography in RHDL (Kyber & Dilithium)
 
-Acest proiect reprezintă o implementare a algoritmilor criptografici post-cuantici Crystals-Kyber și Crystals-Dilithium, adaptată pentru sinteză hardware (FPGA) folosind limbajul RHDL.
+Acest proiect reprezintă o implementare a algoritmilor criptografici post-cuantici Crystals-Kyber și Crystals-Dilithium, adaptată pentru sinteză hardware (FPGA) folosind limbajul RHDL. Implementarea este organizată modular pentru a facilita înțelegerea, testarea și reutilizarea componentelor.
 
 Codul este organizat în module distincte pentru fiecare algoritm.
 1. Kyber - Mecanism de Încapsulare a Cheilor
@@ -73,3 +73,4 @@ Codul este organizat în module distincte pentru fiecare algoritm.
    # shake.rs
 
         Implementarea funcțiilor de extensie SHAKE128 și SHAKE256, utilizate extensiv în ambii algoritmi pentru generarea numerelor pseudo-aleatoare.
+
