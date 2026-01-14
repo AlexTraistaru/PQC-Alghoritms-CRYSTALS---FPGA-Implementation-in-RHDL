@@ -1,6 +1,6 @@
 /target
 **/*.rs.bk
-/kat_kyber512
+/kat_kyber512.txt
 *.exe
 *.dll
 *.pdb
