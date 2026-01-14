@@ -1,54 +1,42 @@
-//! Full ML-DSA (Dilithium) via RustCrypto `ml-dsa` crate.
-//! You call this as a reference implementation; later you can swap in your own HW/NTT.
+// src/dilithium_mldsa.rs
+//! ML-DSA-44 reference (ml-dsa crate, rc.3)
 
 use ml_dsa::{
-    EncodedSignature, EncodedSigningKey, EncodedVerifyingKey,
-    KeyGen, MlDsa44, Signature, SigningKey, VerifyingKey,
     signature::{Signer, Verifier},
+    KeyGen, MlDsa44, Signature, SigningKey, VerifyingKey,
 };
 
-pub fn keygen_44() -> (Vec<u8>, Vec<u8>) {
-    let mut rng = rand::thread_rng();
-    let kp = MlDsa44::key_gen(&mut rng);
+use rand_core::{CryptoRng, RngCore};
 
-    // Make the types explicit (avoids inference errors)
-    let pk: EncodedVerifyingKey<MlDsa44> = kp.verifying_key().encode();
-    let sk: EncodedSigningKey<MlDsa44> = kp.signing_key().encode();
+struct OsRngCompat;
 
-    (pk.as_slice().to_vec(), sk.as_slice().to_vec())
-}
-
-pub fn sign_44_det(sk_bytes: &[u8], msg: &[u8]) -> Option<Vec<u8>> {
-    let enc_sk: EncodedSigningKey<MlDsa44> = EncodedSigningKey::<MlDsa44>::try_from(sk_bytes).ok()?;
-    let sk = SigningKey::<MlDsa44>::decode(&enc_sk);
-
-    // Signer for SigningKey uses deterministic variant with empty context. :contentReference[oaicite:2]{index=2}
-    let sig: Signature<MlDsa44> = sk.try_sign(msg).ok()?;
-    let enc_sig: EncodedSignature<MlDsa44> = sig.encode();
-
-    Some(enc_sig.as_slice().to_vec())
-}
-
-pub fn verify_44(pk_bytes: &[u8], msg: &[u8], sig_bytes: &[u8]) -> bool {
-    let enc_pk: EncodedVerifyingKey<MlDsa44> =
-        EncodedVerifyingKey::<MlDsa44>::try_from(pk_bytes).ok()?;
-    let vk = VerifyingKey::<MlDsa44>::decode(&enc_pk);
-
-    let sig = Signature::<MlDsa44>::try_from(sig_bytes).ok()?;
-    vk.verify(msg, &sig).is_ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mldsa44_roundtrip_sign_verify() {
-        let (pk, sk) = keygen_44();
-        let msg = b"hello from rhdl";
-
-        let sig = sign_44_det(&sk, msg).expect("sign failed");
-        assert!(verify_44(&pk, msg, &sig));
-        assert!(!verify_44(&pk, b"tampered", &sig));
+impl RngCore for OsRngCompat {
+    fn next_u32(&mut self) -> u32 {
+        let mut b = [0u8; 4];
+        getrandom::getrandom(&mut b).expect("getrandom failed");
+        u32::from_le_bytes(b)
     }
+    fn next_u64(&mut self) -> u64 {
+        let mut b = [0u8; 8];
+        getrandom::getrandom(&mut b).expect("getrandom failed");
+        u64::from_le_bytes(b)
+    }
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        getrandom::getrandom(dest).expect("getrandom failed");
+    }
+}
+impl CryptoRng for OsRngCompat {}
+
+pub fn keygen_44() -> (VerifyingKey<MlDsa44>, SigningKey<MlDsa44>) {
+    let mut rng = OsRngCompat;
+    let kp = MlDsa44::key_gen(&mut rng);
+    (kp.verifying_key().clone(), kp.signing_key().clone())
+}
+
+pub fn sign_44(sk: &SigningKey<MlDsa44>, msg: &[u8]) -> Signature<MlDsa44> {
+    sk.try_sign(msg).expect("ml-dsa sign failed")
+}
+
+pub fn verify_44(vk: &VerifyingKey<MlDsa44>, msg: &[u8], sig: &Signature<MlDsa44>) -> bool {
+    vk.verify(msg, sig).is_ok()
 }

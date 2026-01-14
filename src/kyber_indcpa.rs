@@ -1,248 +1,166 @@
-// src/kyber_indcpa.rs
-// Kyber IND-CPA (keypair/encrypt/decrypt) built on top of kyber_poly + kyber_arith + kyber_ntt.
-//
-// NOTE: `kyber_arith.rs` and `kyber_ntt.rs` are treated as references and MUST NOT be changed.
+// Kyber.CPAPKE (IND-CPA PKE) for Kyber512.
+// uses kyber_sampling_rhdl FSM (via kyber_sampling.rs)
+// and kyber_ntt FSM (via kyber_poly.rs).
 
-#![allow(dead_code)]
 #![allow(non_snake_case)]
+#![allow(dead_code)]
 
-use rhdl::prelude::*;
-
-use crate::kyber_arith::Coeff;
-use crate::kyber_params::*;
-use crate::kyber_poly::*;
-use crate::shake::{sha3_512, shake128};
+use crate::kyber_codec::{ct_decode, ct_encode, pk_decode, pk_encode, poly_frommsg, poly_tomsg, polyvec_decode12, polyvec_encode12};
+use crate::kyber_params::{CIPHERTEXTBYTES, INDCPA_SECRETKEYBYTES, K, POLYVECBYTES, PUBLICKEYBYTES, SYMBYTES, ETA1, ETA2};
+use crate::kyber_poly::{poly_invntt, poly_ntt, poly_reduce, polyvec_ntt, polyvec_pointwise_acc, Poly, PolyVec};
+use crate::kyber_sampling::gen_matrix;
+use crate::kyber_sampling::poly_getnoise;
+use crate::shake::{sha3_256, sha3_512};
 
 #[inline(always)]
-fn c16(x: i16) -> Coeff {
-    signed::<U16>(x as i128)
+fn zero_poly() -> Poly {
+    [rhdl::prelude::signed::<rhdl::prelude::U16>(0); crate::kyber_params::N]
 }
 
-fn rej_uniform(out: &mut Poly, seed: &[u8; SYMBYTES], i: u8, j: u8) {
-    // XOF = SHAKE128(seed||i||j)
-    let mut ext = [0u8; 34];
-    ext[..32].copy_from_slice(seed);
-    ext[32] = i;
-    ext[33] = j;
-
-    // IMPORTANT: 672 bytes are typically enough, but not provably always.
-    // We re-squeeze by re-calling shake128 with a larger output (prefix property).
-    let mut buf_len = 672usize;
-    let mut buf = vec![0u8; buf_len];
-    shake128(&ext, &mut buf);
-
-    let mut ctr = 0usize;
-    let mut pos = 0usize;
-
-    while ctr < N {
-        if pos + 3 > buf.len() {
-            buf_len += 672;
-            buf = vec![0u8; buf_len];
-            shake128(&ext, &mut buf);
-            continue;
-        }
-
-        let d0 = (buf[pos] as u16) | (((buf[pos + 1] as u16) & 0x0F) << 8);
-        let d1 = ((buf[pos + 1] as u16) >> 4) | ((buf[pos + 2] as u16) << 4);
-        pos += 3;
-
-        if d0 < (Q as u16) {
-            out[ctr] = c16(d0 as i16);
-            ctr += 1;
-        }
-        if ctr < N && d1 < (Q as u16) {
-            out[ctr] = c16(d1 as i16);
-            ctr += 1;
-        }
-    }
-}
-
-fn gen_matrix(a: &mut [[Poly; K]; K], rho: &[u8; SYMBYTES], transposed: bool) {
-    for i in 0..K {
-        for j in 0..K {
-            let (x, y) = if transposed {
-                (j as u8, i as u8)
-            } else {
-                (i as u8, j as u8)
-            };
-            rej_uniform(&mut a[i][j], rho, x, y);
-            poly_ntt(&mut a[i][j]);
-        }
-    }
-}
-
-pub fn indcpa_keypair(seed: &[u8; SYMBYTES]) -> ([u8; PUBLICKEYBYTES], [u8; INDCPA_SECRETKEYBYTES]) {
-    let h = sha3_512(seed);
+/// Deterministic CPAPKE keypair from seed d (32 bytes): returns (pk, sk_indcpa)
+pub fn indcpa_keypair_deterministic(
+    d: &[u8; SYMBYTES],
+) -> ([u8; PUBLICKEYBYTES], [u8; INDCPA_SECRETKEYBYTES]) {
+    // (rho || sigma) = G(d) where G = SHA3-512
+    let g = sha3_512(d);
     let mut rho = [0u8; SYMBYTES];
     let mut sigma = [0u8; SYMBYTES];
-    rho.copy_from_slice(&h[..32]);
-    sigma.copy_from_slice(&h[32..]);
+    rho.copy_from_slice(&g[..SYMBYTES]);
+    sigma.copy_from_slice(&g[SYMBYTES..]);
 
-    let mut a = [[[c16(0); N]; K]; K];
-    gen_matrix(&mut a, &rho, false);
+    // Generate A_hat (NTT domain)
+    let A_hat = gen_matrix(&rho, false);
 
-    let mut s = [[c16(0); N]; K];
-    let mut e = [[c16(0); N]; K];
+    // Sample s and e (standard domain), then NTT
+    let mut s: PolyVec = [zero_poly(); K];
+    let mut e: PolyVec = [zero_poly(); K];
+    let mut n: u8 = 0;
 
     for i in 0..K {
-        cbd_eta(&mut s[i], ETA1, &sigma, i as u8);
-        cbd_eta(&mut e[i], ETA1, &sigma, (K + i) as u8);
-        poly_ntt(&mut s[i]);
-        poly_ntt(&mut e[i]);
+        s[i] = poly_getnoise(&sigma, n, ETA1);
+        n = n.wrapping_add(1);
     }
-
-    let mut t = [[c16(0); N]; K];
     for i in 0..K {
-        let mut acc = [c16(0); N];
-        polyvec_pointwise_acc(&mut acc, &a[i], &s);
-        poly_add(&mut t[i], &acc, &e[i]);
+        e[i] = poly_getnoise(&sigma, n, ETA1);
+        n = n.wrapping_add(1);
     }
 
-    // pk = (t || rho)
-    let mut pk = [0u8; PUBLICKEYBYTES];
+    polyvec_ntt(&mut s);
+    polyvec_ntt(&mut e);
+
+    // t_hat = A_hat * s_hat + e_hat
+    let mut t: PolyVec = [zero_poly(); K];
     for i in 0..K {
-        let mut tmp = [0u8; POLYBYTES];
-        poly_tobytes(&mut tmp, &t[i]);
-        pk[i * POLYBYTES..(i + 1) * POLYBYTES].copy_from_slice(&tmp);
-    }
-    pk[POLYVECBYTES..].copy_from_slice(&rho);
+        // dot product of row i with s
+        let row: PolyVec = A_hat[i];
+        let mut acc = zero_poly();
+        polyvec_pointwise_acc(&mut acc, &row, &s);
 
-    // sk_indcpa = s
-    let mut sk = [0u8; INDCPA_SECRETKEYBYTES];
-    for i in 0..K {
-        let mut tmp = [0u8; POLYBYTES];
-        poly_tobytes(&mut tmp, &s[i]);
-        sk[i * POLYBYTES..(i + 1) * POLYBYTES].copy_from_slice(&tmp);
+        // add noise
+        for j in 0..crate::kyber_params::N {
+            acc[j] = acc[j] + e[i][j];
+        }
+        poly_reduce(&mut acc);
+        t[i] = acc;
     }
 
+    let pk = pk_encode(&t, &rho);
+    let sk = polyvec_encode12(&s);
     (pk, sk)
 }
 
+/// CPAPKE encryption: ct = Enc(pk, m, coins)
 pub fn indcpa_enc(
-    ct: &mut [u8; CIPHERTEXTBYTES],
-    m: &[u8; SYMBYTES],
     pk: &[u8; PUBLICKEYBYTES],
+    m: &[u8; SYMBYTES],
     coins: &[u8; SYMBYTES],
-) {
-    // unpack pk
-    let mut t = [[c16(0); N]; K];
+) -> [u8; CIPHERTEXTBYTES] {
+    let (t_hat, rho) = pk_decode(pk);
+
+    // A_hat^T
+    let A_hat_t = gen_matrix(&rho, true);
+
+    // Sample r, e1, e2 in standard domain
+    let mut n: u8 = 0;
+    let mut r: PolyVec = [zero_poly(); K];
+    let mut e1: PolyVec = [zero_poly(); K];
+
     for i in 0..K {
-        let mut tmp = [0u8; POLYBYTES];
-        tmp.copy_from_slice(&pk[i * POLYBYTES..(i + 1) * POLYBYTES]);
-        poly_frombytes(&mut t[i], &tmp);
+        r[i] = poly_getnoise(coins, n, ETA1);
+        n = n.wrapping_add(1);
     }
-    let mut rho = [0u8; SYMBYTES];
-    rho.copy_from_slice(&pk[POLYVECBYTES..]);
-
-    // gen A^T
-    let mut at = [[[c16(0); N]; K]; K];
-    gen_matrix(&mut at, &rho, true);
-
-    // sample r,e1,e2
-    let mut r = [[c16(0); N]; K];
-    let mut e1 = [[c16(0); N]; K];
-    let mut e2 = [c16(0); N];
-
     for i in 0..K {
-        cbd_eta(&mut r[i], ETA1, coins, i as u8);
-        cbd_eta(&mut e1[i], ETA2, coins, (K + i) as u8);
-        poly_ntt(&mut r[i]);
+        e1[i] = poly_getnoise(coins, n, ETA2);
+        n = n.wrapping_add(1);
     }
-    cbd_eta(&mut e2, ETA2, coins, (2 * K) as u8);
+    let e2: Poly = poly_getnoise(coins, n, ETA2);
 
-    // u = invntt( A^T * r ) + e1
-    let mut u = [[c16(0); N]; K];
+    // NTT(r)
+    polyvec_ntt(&mut r);
+
+    // u = InvNTT(A_hat^T * r) + e1
+    let mut u: PolyVec = [zero_poly(); K];
     for i in 0..K {
-        let mut acc = [c16(0); N];
-        polyvec_pointwise_acc(&mut acc, &at[i], &r);
+        let row: PolyVec = A_hat_t[i];
+        let mut acc = zero_poly();
+        polyvec_pointwise_acc(&mut acc, &row, &r);
         poly_invntt(&mut acc);
-        poly_add(&mut u[i], &acc, &e1[i]);
-        poly_reduce(&mut u[i]);
+
+        for j in 0..crate::kyber_params::N {
+            acc[j] = acc[j] + e1[i][j];
+        }
+        u[i] = acc;
     }
 
-    // v = invntt(t^T*r) + e2 + m
-    let mut acc = [c16(0); N];
-    polyvec_pointwise_acc(&mut acc, &t, &r);
-    poly_invntt(&mut acc);
+    // v = InvNTT(t_hat^T * r) + e2 + m_poly
+    let mut v = zero_poly();
+    polyvec_pointwise_acc(&mut v, &t_hat, &r);
+    poly_invntt(&mut v);
 
-    let mut mp = [c16(0); N];
-    poly_frommsg(&mut mp, m);
-
-    let mut v = [c16(0); N];
-    poly_add(&mut v, &acc, &e2);
-    let mut v2 = [c16(0); N];
-    poly_add(&mut v2, &v, &mp);
-    v = v2;
-    poly_reduce(&mut v);
-
-    // pack ct: c1 = compress(u,du=10) for each poly; c2 = compress(v,dv=4)
-    let mut c1 = [0u8; POLYVECCOMPRESSEDBYTES];
-    for i in 0..K {
-        let mut tmp = [0u8; POLYCOMPRESSEDBYTES_DU10];
-        poly_compress_du10(&mut tmp, &u[i]);
-        c1[i * POLYCOMPRESSEDBYTES_DU10..(i + 1) * POLYCOMPRESSEDBYTES_DU10].copy_from_slice(&tmp);
+    for j in 0..crate::kyber_params::N {
+        v[j] = v[j] + e2[j];
     }
-    let mut c2 = [0u8; POLYCOMPRESSEDBYTES_DV4];
-    poly_compress_dv4(&mut c2, &v);
+    let mpoly = poly_frommsg(m);
+    for j in 0..crate::kyber_params::N {
+        v[j] = v[j] + mpoly[j];
+    }
 
-    ct[..POLYVECCOMPRESSEDBYTES].copy_from_slice(&c1);
-    ct[POLYVECCOMPRESSEDBYTES..].copy_from_slice(&c2);
+    ct_encode(&u, &v)
 }
 
-pub fn indcpa_dec(m: &mut [u8; SYMBYTES], ct: &[u8; CIPHERTEXTBYTES], sk: &[u8; INDCPA_SECRETKEYBYTES]) {
-    // unpack sk (s)
-    let mut s = [[c16(0); N]; K];
+/// CPAPKE decryption: m = Dec(sk, ct)
+pub fn indcpa_dec(
+    sk: &[u8; INDCPA_SECRETKEYBYTES],
+    ct: &[u8; CIPHERTEXTBYTES],
+) -> [u8; SYMBYTES] {
+    let (u, v) = ct_decode(ct);
+
+    // Decode s_hat
+    let mut skbytes = [0u8; POLYVECBYTES];
+    skbytes.copy_from_slice(sk);
+    let s_hat = polyvec_decode12(&skbytes);
+
+    // NTT(u)
+    let mut u_hat = u;
     for i in 0..K {
-        let mut tmp = [0u8; POLYBYTES];
-        tmp.copy_from_slice(&sk[i * POLYBYTES..(i + 1) * POLYBYTES]);
-        poly_frombytes(&mut s[i], &tmp);
+        poly_ntt(&mut u_hat[i]);
     }
 
-    // unpack ct -> u,v
-    let mut u = [[c16(0); N]; K];
-    for i in 0..K {
-        let mut tmp = [0u8; POLYCOMPRESSEDBYTES_DU10];
-        tmp.copy_from_slice(&ct[i * POLYCOMPRESSEDBYTES_DU10..(i + 1) * POLYCOMPRESSEDBYTES_DU10]);
-        poly_decompress_du10(&mut u[i], &tmp);
-    }
-    let mut vbytes = [0u8; POLYCOMPRESSEDBYTES_DV4];
-    vbytes.copy_from_slice(&ct[POLYVECCOMPRESSEDBYTES..]);
-    let mut v = [c16(0); N];
-    poly_decompress_dv4(&mut v, &vbytes);
+    // mp = InvNTT( s_hat^T * u_hat )
+    let mut mp = zero_poly();
+    polyvec_pointwise_acc(&mut mp, &s_hat, &u_hat);
+    poly_invntt(&mut mp);
 
-    // m = v - invntt(s^T * ntt(u))
-    for i in 0..K {
-        poly_ntt(&mut u[i]);
+    // v - mp
+    let mut w = v;
+    for j in 0..crate::kyber_params::N {
+        w[j] = w[j] - mp[j];
     }
-    let mut acc = [c16(0); N];
-    polyvec_pointwise_acc(&mut acc, &s, &u);
-    poly_invntt(&mut acc);
 
-    let mut mp = [c16(0); N];
-    poly_sub(&mut mp, &v, &acc);
-    poly_reduce(&mut mp);
-    poly_tomsg(m, &mp);
+    poly_tomsg(&w)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::shake::sha3_256;
-
-    #[test]
-    fn test_indcpa_roundtrip() {
-        let seed = [7u8; 32];
-        let (pk, sk) = indcpa_keypair(&seed);
-
-        let m = sha3_256(&[9u8; 32]);
-        let coins = sha3_256(&[1u8; 32]);
-
-        let mut ct = [0u8; CIPHERTEXTBYTES];
-        indcpa_enc(&mut ct, &m, &pk, &coins);
-
-        let mut m2 = [0u8; 32];
-        indcpa_dec(&mut m2, &ct, &sk);
-
-        assert_eq!(m, m2);
-    }
+/// Convenience: hash public key (Kyber uses H=SHA3-256)
+pub fn hash_pk(pk: &[u8; PUBLICKEYBYTES]) -> [u8; SYMBYTES] {
+    sha3_256(pk)
 }

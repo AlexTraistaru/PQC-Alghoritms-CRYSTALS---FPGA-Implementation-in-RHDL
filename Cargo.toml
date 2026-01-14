@@ -22,3 +22,11 @@ panic = "abort"
 rhdl = {git = "https://github.com/samitbasu/rhdl.git",rev = "8d04954"}
 rhdl-fpga = {git = "https://github.com/samitbasu/rhdl.git",rev = "8d04954"}
 rhdl-bits = {git = "https://github.com/samitbasu/rhdl.git",rev = "8d04954"}
+pqcrypto-kyber = "0.8"
+pqcrypto-traits = "0.3"
+ml-dsa = { version = "0.1.0-rc.3" }
+rand_core = "0.10.0-rc.3"
+getrandom = "0.2"
+aes = "0.8"
+cipher = "0.4"
+hex = "0.4"

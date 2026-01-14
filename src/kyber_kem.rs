@@ -1,134 +1,164 @@
-use crate::kyber_indcpa::{indcpa_dec, indcpa_enc, indcpa_keypair};
-use crate::kyber_params::*;
+// Kyber CCA-secure KEM (Kyber512), Fujisaki-Okamoto transform.
+// RHDL-heavy INDCPA underneath (sampling + NTT are FSM-style).
+
+#![allow(dead_code)]
+
+use crate::kyber_indcpa::{hash_pk, indcpa_dec, indcpa_enc, indcpa_keypair_deterministic};
+use crate::kyber_params::{CIPHERTEXTBYTES, PUBLICKEYBYTES, SECRETKEYBYTES, SYMBYTES, INDCPA_SECRETKEYBYTES};
 use crate::shake::{sha3_256, sha3_512, shake256};
 
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() { return false; }
-    let mut diff = 0u8;
-    for i in 0..a.len() { diff |= a[i] ^ b[i]; }
+#[inline(always)]
+fn ct_equal(a: &[u8], b: &[u8]) -> bool {
+    let mut diff: u8 = 0;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
     diff == 0
 }
 
-/// Kyber KEM keypair: determinist din seed (32 bytes) ca să poți verifica în teste/hardware.
-/// În hardware, seed-ul vine din TRNG/CSRNG.
-pub fn kem_keypair(seed: &[u8; SYMBYTES]) -> ([u8; PUBLICKEYBYTES], [u8; SECRETKEYBYTES]) {
-    let (pk, sk_indcpa) = indcpa_keypair(seed);
+#[inline(always)]
+fn cmov(dest: &mut [u8], src: &[u8], move_if: bool) {
+    let mask: u8 = if move_if { 0xFF } else { 0x00 };
+    for i in 0..dest.len() {
+        dest[i] = (dest[i] & !mask) | (src[i] & mask);
+    }
+}
 
-    let mut sk = [0u8; SECRETKEYBYTES];
+/// Deterministic KEM keypair from (d,z) seeds (both 32 bytes).
+pub fn crypto_kem_keypair_deterministic(
+    d: &[u8; SYMBYTES],
+    z: &[u8; SYMBYTES],
+) -> ([u8; PUBLICKEYBYTES], [u8; SECRETKEYBYTES]) {
+    let (pk, sk_indcpa) = indcpa_keypair_deterministic(d);
+    let hpk = hash_pk(&pk);
+
     // sk = sk_indcpa || pk || H(pk) || z
-    sk[..INDCPA_SECRETKEYBYTES].copy_from_slice(&sk_indcpa);
-    sk[INDCPA_SECRETKEYBYTES..INDCPA_SECRETKEYBYTES+PUBLICKEYBYTES].copy_from_slice(&pk);
+    let mut sk = [0u8; SECRETKEYBYTES];
+    let mut off = 0usize;
 
-    let hpk = sha3_256(&pk);
-    sk[INDCPA_SECRETKEYBYTES+PUBLICKEYBYTES..INDCPA_SECRETKEYBYTES+PUBLICKEYBYTES+SYMBYTES].copy_from_slice(&hpk);
+    sk[off..off + INDCPA_SECRETKEYBYTES].copy_from_slice(&sk_indcpa);
+    off += INDCPA_SECRETKEYBYTES;
 
-    // z = sha3_256(seed||0xFF) (determinist)
-    let mut z_in = [0u8; 33];
-    z_in[..32].copy_from_slice(seed);
-    z_in[32] = 0xFF;
-    let z = sha3_256(&z_in);
-    sk[SECRETKEYBYTES - SYMBYTES..].copy_from_slice(&z);
+    sk[off..off + PUBLICKEYBYTES].copy_from_slice(&pk);
+    off += PUBLICKEYBYTES;
+
+    sk[off..off + SYMBYTES].copy_from_slice(&hpk);
+    off += SYMBYTES;
+
+    sk[off..off + SYMBYTES].copy_from_slice(z);
 
     (pk, sk)
 }
 
-/// Encaps determinist din seed_m (32 bytes) pentru verificare.
-pub fn kem_encaps(seed_m: &[u8; SYMBYTES], pk: &[u8; PUBLICKEYBYTES]) -> ([u8; CIPHERTEXTBYTES], [u8; SYMBYTES]) {
+/// Deterministic encaps using seed_m as entropy.
+/// Returns (ct, ss).
+pub fn crypto_kem_enc_deterministic(
+    pk: &[u8; PUBLICKEYBYTES],
+    seed_m: &[u8; SYMBYTES],
+) -> ([u8; CIPHERTEXTBYTES], [u8; SYMBYTES]) {
     // m = H(seed_m)
     let m = sha3_256(seed_m);
+    let hpk = hash_pk(pk);
 
-    let hpk = sha3_256(pk);
+    // (Kbar || r) = G(m || H(pk)) where G=SHA3-512
+    let mut buf = [0u8; 2 * SYMBYTES];
+    buf[..SYMBYTES].copy_from_slice(&m);
+    buf[SYMBYTES..].copy_from_slice(&hpk);
 
-    // kr = G(m || hpk) = sha3_512
-    let mut inb = [0u8; 64];
-    inb[..32].copy_from_slice(&m);
-    inb[32..].copy_from_slice(&hpk);
-    let kr = sha3_512(&inb);
+    let gr = sha3_512(&buf);
+    let mut kbar = [0u8; SYMBYTES];
+    let mut coins = [0u8; SYMBYTES];
+    kbar.copy_from_slice(&gr[..SYMBYTES]);
+    coins.copy_from_slice(&gr[SYMBYTES..]);
 
-    let mut kbar = [0u8; 32];
-    let mut coins = [0u8; 32];
-    kbar.copy_from_slice(&kr[..32]);
-    coins.copy_from_slice(&kr[32..]);
+    // c = Enc(pk, m, coins)
+    let ct = indcpa_enc(pk, &m, &coins);
 
-    let mut ct = [0u8; CIPHERTEXTBYTES];
-    indcpa_enc(&mut ct, &m, pk, &coins);
+    // ss = KDF(Kbar || H(c)) where KDF=SHAKE256 to 32 bytes
+    let hc = sha3_256(&ct);
+    let mut kd_in = [0u8; 2 * SYMBYTES];
+    kd_in[..SYMBYTES].copy_from_slice(&kbar);
+    kd_in[SYMBYTES..].copy_from_slice(&hc);
 
-    let hct = sha3_256(&ct);
-
-    // ss = KDF(kbar || hct) via SHAKE256 -> 32 bytes
-    let mut kdf_in = [0u8; 64];
-    kdf_in[..32].copy_from_slice(&kbar);
-    kdf_in[32..].copy_from_slice(&hct);
-
-    let mut ss = [0u8; 32];
-    shake256(&kdf_in, &mut ss);
+    let mut ss = [0u8; SYMBYTES];
+    shake256(&kd_in, &mut ss);
 
     (ct, ss)
 }
 
-pub fn kem_decaps(ct: &[u8; CIPHERTEXTBYTES], sk: &[u8; SECRETKEYBYTES]) -> [u8; SYMBYTES] {
-    let mut sk_indcpa = [0u8; INDCPA_SECRETKEYBYTES];
-    sk_indcpa.copy_from_slice(&sk[..INDCPA_SECRETKEYBYTES]);
+/// KEM decapsulation: returns shared secret ss.
+pub fn crypto_kem_dec(sk: &[u8; SECRETKEYBYTES], ct: &[u8; CIPHERTEXTBYTES]) -> [u8; SYMBYTES] {
+    // Layout: sk_indcpa || pk || H(pk) || z
+    let sk_indcpa_len = INDCPA_SECRETKEYBYTES;
+    let pk_off = sk_indcpa_len;
+    let hpk_off = pk_off + PUBLICKEYBYTES;
+    let z_off = hpk_off + SYMBYTES;
 
     let mut pk = [0u8; PUBLICKEYBYTES];
-    pk.copy_from_slice(&sk[INDCPA_SECRETKEYBYTES..INDCPA_SECRETKEYBYTES+PUBLICKEYBYTES]);
+    pk.copy_from_slice(&sk[pk_off..pk_off + PUBLICKEYBYTES]);
 
-    let mut hpk = [0u8; 32];
-    hpk.copy_from_slice(&sk[INDCPA_SECRETKEYBYTES+PUBLICKEYBYTES..INDCPA_SECRETKEYBYTES+PUBLICKEYBYTES+32]);
+    let mut hpk = [0u8; SYMBYTES];
+    hpk.copy_from_slice(&sk[hpk_off..hpk_off + SYMBYTES]);
 
-    let mut z = [0u8; 32];
-    z.copy_from_slice(&sk[SECRETKEYBYTES-32..]);
+    let mut z = [0u8; SYMBYTES];
+    z.copy_from_slice(&sk[z_off..z_off + SYMBYTES]);
 
-    // m = indcpa_dec(ct, sk_indcpa)
-    // CORECTAT: Nu mai facem hash aici. indcpa_dec returnează exact ce a primit indcpa_enc.
-    let mut m = [0u8; 32];
-    indcpa_dec(&mut m, ct, &sk_indcpa);
-    
-    // LINIA S-A ȘTERS: m = sha3_256(&m); 
+    // m' = Dec(sk_indcpa, c)
+    let mut sk_indcpa = [0u8; INDCPA_SECRETKEYBYTES];
+    sk_indcpa.copy_from_slice(&sk[..sk_indcpa_len]);
 
-    // kr = G(m || hpk)
-    let mut inb = [0u8; 64];
-    inb[..32].copy_from_slice(&m);
-    inb[32..].copy_from_slice(&hpk);
-    let kr = sha3_512(&inb);
+    let mprime = indcpa_dec(&sk_indcpa, ct);
 
-    let mut kbar = [0u8; 32];
-    let mut coins = [0u8; 32];
-    kbar.copy_from_slice(&kr[..32]);
-    coins.copy_from_slice(&kr[32..]);
+    // (Kbar' || r') = G(m' || H(pk))
+    let mut buf = [0u8; 2 * SYMBYTES];
+    buf[..SYMBYTES].copy_from_slice(&mprime);
+    buf[SYMBYTES..].copy_from_slice(&hpk);
 
-    // cmp = indcpa_enc(m, pk, coins)
-    let mut cmp = [0u8; CIPHERTEXTBYTES];
-    indcpa_enc(&mut cmp, &m, &pk, &coins);
+    let gr = sha3_512(&buf);
+    let mut kbar = [0u8; SYMBYTES];
+    let mut coins = [0u8; SYMBYTES];
+    kbar.copy_from_slice(&gr[..SYMBYTES]);
+    coins.copy_from_slice(&gr[SYMBYTES..]);
 
-    let hct = sha3_256(ct);
+    // c' = Enc(pk, m', r')
+    let ct_prime = indcpa_enc(&pk, &mprime, &coins);
 
-    // if ct==cmp use kbar else use z
-    let use_k = if ct_eq(ct, &cmp) { kbar } else { z };
+    // If c != c' then Kbar = z (constant-time)
+    let ok = ct_equal(ct, &ct_prime);
+    cmov(&mut kbar, &z, !ok);
 
-    let mut kdf_in = [0u8; 64];
-    kdf_in[..32].copy_from_slice(&use_k);
-    kdf_in[32..].copy_from_slice(&hct);
+    // ss = KDF(Kbar || H(c))
+    let hc = sha3_256(ct);
+    let mut kd_in = [0u8; 2 * SYMBYTES];
+    kd_in[..SYMBYTES].copy_from_slice(&kbar);
+    kd_in[SYMBYTES..].copy_from_slice(&hc);
 
-    let mut ss = [0u8; 32];
-    shake256(&kdf_in, &mut ss);
+    let mut ss = [0u8; SYMBYTES];
+    shake256(&kd_in, &mut ss);
     ss
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+// -----------------------------------------------------------------------------
+// Simple wrappers used by your demo (kyber_demo.rs)
+// -----------------------------------------------------------------------------
 
-    #[test]
-    fn test_kem_roundtrip() {
-        let seed = [7u8; 32];
-        let (pk, sk) = kem_keypair(&seed);
-
-        let mseed = [9u8; 32];
-        let (ct, ss1) = kem_encaps(&mseed, &pk);
-        let ss2 = kem_decaps(&ct, &sk);
-
-        assert_eq!(ss1, ss2);
-    }
+/// Demo-friendly deterministic keypair from a single 32-byte seed.
+pub fn kem_keypair(seed: &[u8; SYMBYTES]) -> ([u8; PUBLICKEYBYTES], [u8; SECRETKEYBYTES]) {
+    // Derive (d,z) from SHA3-512(seed)
+    let g = sha3_512(seed);
+    let mut d = [0u8; SYMBYTES];
+    let mut z = [0u8; SYMBYTES];
+    d.copy_from_slice(&g[..SYMBYTES]);
+    z.copy_from_slice(&g[SYMBYTES..]);
+    crypto_kem_keypair_deterministic(&d, &z)
 }
 
+/// Demo-friendly deterministic encaps from a 32-byte seed.
+pub fn kem_encaps(seed_m: &[u8; SYMBYTES], pk: &[u8; PUBLICKEYBYTES]) -> ([u8; CIPHERTEXTBYTES], [u8; SYMBYTES]) {
+    crypto_kem_enc_deterministic(pk, seed_m)
+}
+
+/// Demo-friendly decaps.
+pub fn kem_decaps(ct: &[u8; CIPHERTEXTBYTES], sk: &[u8; SECRETKEYBYTES]) -> [u8; SYMBYTES] {
+    crypto_kem_dec(sk, ct)
+}

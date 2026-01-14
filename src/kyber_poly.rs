@@ -1,4 +1,3 @@
-// src/kyber_poly.rs
 // Kyber polynomial helpers (poly/polyvec), packing/compression, and CBD noise sampler.
 //
 // NOTE: `kyber_arith.rs` and `kyber_ntt.rs` are treated as references and MUST NOT be changed.
@@ -9,9 +8,7 @@
 
 use rhdl::prelude::*;
 
-use crate::kyber_arith::{
-    add, barrett_reduce, csubq, fqmul, freeze, montgomery_reduce, sub, Coeff,
-};
+use crate::kyber_arith::{barrett_reduce, csubq, fqmul, freeze, montgomery_reduce, Coeff};
 use crate::kyber_ntt::{ntt_step, MemReq, NttIn, NttState};
 use crate::kyber_params::*;
 use crate::shake::shake256;
@@ -29,7 +26,6 @@ fn c16(x: i16) -> Coeff {
 
 #[inline(always)]
 fn coef_to_i16(x: Coeff) -> i16 {
-    // RHDL SignedBits typically exposes `.raw()`; keep this local to avoid changing arith/ntt.
     x.raw() as i16
 }
 
@@ -109,7 +105,6 @@ fn run_ntt(mem: &mut Poly, inverse: bool) {
         }
     }
 
-    // If we ever hit this, something is wrong with the FSM integration.
     panic!("NTT FSM did not finish within the cycle bound");
 }
 
@@ -130,12 +125,7 @@ pub fn poly_csubq(a: &mut Poly) {
 }
 
 /// Forward NTT.
-///
-/// We keep the exact pre/post behavior that your previous `poly_ntt` used:
-/// multiply by R^2 first (via fqmul) then run the reference NTT FSM, then reduce.
 pub fn poly_ntt(a: &mut Poly) {
-    // R2 = 1353 = R^2 mod q, used for Kyber's to-Montgomery conversion.
-    // Keeping this to match your existing pipeline.
     const R2: i16 = 1353;
     let r2 = c16(R2);
     for i in 0..N {
@@ -147,9 +137,6 @@ pub fn poly_ntt(a: &mut Poly) {
 }
 
 /// Inverse NTT.
-///
-/// We run the reference inverse FSM, then apply two Montgomery reductions per coeff,
-/// matching your previous working conversion back to the normal domain.
 pub fn poly_invntt(a: &mut Poly) {
     run_ntt(a, true);
 
@@ -160,20 +147,27 @@ pub fn poly_invntt(a: &mut Poly) {
 }
 
 #[inline(always)]
-fn basemul(r0: &mut Coeff, r1: &mut Coeff, a0: Coeff, a1: Coeff, b0: Coeff, b1: Coeff, zeta: Coeff) {
+fn basemul(
+    r0: &mut Coeff,
+    r1: &mut Coeff,
+    a0: Coeff,
+    a1: Coeff,
+    b0: Coeff,
+    b1: Coeff,
+    zeta: Coeff,
+) {
     let t0 = fqmul(a1, b1);
     let t0z = fqmul(t0, zeta);
     let t1 = fqmul(a0, b0);
-    *r0 = add(t1, t0z);
+    *r0 = t1 + t0z;
 
     let t2 = fqmul(a0, b1);
     let t3 = fqmul(a1, b0);
-    *r1 = add(t2, t3);
+    *r1 = t2 + t3;
 }
 
 pub fn poly_basemul_montgomery(r: &mut Poly, a: &Poly, b: &Poly) {
     for i in 0..(N / 4) {
-        // Kyber uses zetas[64..] for base multiplication.
         let zeta = c16(ZETAS[64 + i]);
 
         let mut r0 = c16(0);
@@ -200,13 +194,13 @@ pub fn poly_basemul_montgomery(r: &mut Poly, a: &Poly, b: &Poly) {
 
 pub fn poly_add(r: &mut Poly, a: &Poly, b: &Poly) {
     for i in 0..N {
-        r[i] = add(a[i], b[i]);
+        r[i] = a[i] + b[i];
     }
 }
 
 pub fn poly_sub(r: &mut Poly, a: &Poly, b: &Poly) {
     for i in 0..N {
-        r[i] = sub(a[i], b[i]);
+        r[i] = a[i] - b[i];
     }
 }
 
@@ -230,7 +224,7 @@ pub fn polyvec_pointwise_acc(r: &mut Poly, a: &PolyVec, b: &PolyVec) {
     for i in 1..K {
         poly_basemul_montgomery(&mut tmp, &a[i], &b[i]);
         for j in 0..N {
-            r[j] = add(r[j], tmp[j]);
+            r[j] = r[j] + tmp[j];
         }
     }
 
@@ -351,7 +345,6 @@ pub fn poly_tomsg(msg: &mut [u8; 32], a: &Poly) {
                 t += Q as i32;
             }
 
-            // bit = floor((2*t + q/2) / q) & 1
             let val = ((t as u32) << 1).wrapping_add((Q as u32) / 2);
             let bit = (val / (Q as u32)) & 1;
             byte |= (bit as u8) << j;
@@ -369,7 +362,10 @@ fn load24_le(x: &[u8]) -> u32 {
 }
 
 fn load32_le(x: &[u8]) -> u32 {
-    (x[0] as u32) | ((x[1] as u32) << 8) | ((x[2] as u32) << 16) | ((x[3] as u32) << 24)
+    (x[0] as u32)
+        | ((x[1] as u32) << 8)
+        | ((x[2] as u32) << 16)
+        | ((x[3] as u32) << 24)
 }
 
 fn prf(out: &mut [u8], key: &[u8; SYMBYTES], nonce: u8) {

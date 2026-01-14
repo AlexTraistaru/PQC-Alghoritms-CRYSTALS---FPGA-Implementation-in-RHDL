@@ -1,7 +1,4 @@
-// src/dilithium_params.rs
 // Parametrii Dilithium2 (și structuri comune). + ZETAS/QINV/F pentru NTT hardware.
-//
-// IMPORTANT: nu generăm zetas (fără bucle), le punem ca tabel constant.
 
 #![allow(dead_code)]
 #![allow(non_upper_case_globals)]
